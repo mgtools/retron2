@@ -1,0 +1,2 @@
+python retron_ncrna_finder.py -i MarsHill.fna -o MarsHill-ncrna.fna --gff MarsHill-ncrna.gff --tsv MarsHill-ncrna.tsv --region-start 213847 --region-end 215077 --min-arm 8 --require-g --both-strands
+python retron_ncrna_finder.py -i SA1.fna -o SA1-ncrna.fna --gff SA1-ncrna.gff --tsv SA1-ncrna.tsv --region-start 9447 --region-end 10635 --min-arm 8 --require-g --both-strandsna.tsv --region-start 99715 --region-end 100172 --min-arm 8 --require-g --both-strands
