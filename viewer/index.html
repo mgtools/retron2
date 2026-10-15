@@ -437,17 +437,17 @@ const CONFIG = {
   // Set these to the raw URLs of your FASTA alignment and dot-bracket files,
   // e.g. raw GitHub URLs:
   //   'https://raw.githubusercontent.com/user/repo/main/alignment.fasta'
-  fastaUrl: '',
-  dotUrl:   '',
+  fastaUrl: '/myRT/ART/SA1/SA1-ncrna-mafft.fasta',
+  dotUrl:   '/myRT/ART/SA1/SA1-ncrna1-MaxExpect.dot',
 
   // Optional label shown in the header when loading from URL
-  label: '',
+  label: 'SA1: MAFFT alignment and RNAstructure MaxExpect structure of ncrna-1',
 
   // Default conservation metric: 'freq' | 'entropy' | 'sop'
   //   'freq'    — Frequency (most common base / total sequences)
   //   'entropy' — Shannon entropy (gap as 5th character, inverted)
   //   'sop'     — Sum-of-pairs (pairwise agreement, gaps as mismatch)
-  consMetric: 'freq',
+  consMetric: 'sop',
 };
 // ══════════════════════════════════════════════════════════════════
 
