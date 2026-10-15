@@ -118,6 +118,5 @@ currently renders only the `()` pairs.
 
 ## Development note
 
-Claude.ai was used during development. Prompts used for these tools were
-intended to be shared here as examples.
+Claude.ai was used during development. 
 
