@@ -26,6 +26,11 @@ from pathlib import Path
 from itertools import product as iterproduct
 
 
+def normalize_seq_id(seq_id):
+    """Normalize sequence identifiers so FASTA and GFF IDs can be matched."""
+    return seq_id.split()[0]
+
+
 # ---------------------------------------------------------------------------
 # FASTA I/O
 # ---------------------------------------------------------------------------
@@ -49,6 +54,205 @@ def parse_fasta(path):
 def reverse_complement(seq):
     comp = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
     return seq.translate(comp)[::-1]
+
+
+# ---------------------------------------------------------------------------
+# GFF helpers
+# ---------------------------------------------------------------------------
+
+def parse_gff(path):
+    """Parse a GFF/GTF-like file and yield feature records."""
+    with open(path) as fh:
+        for line_no, raw_line in enumerate(fh, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split("\t")
+            if len(parts) < 9:
+                continue
+
+            seq_id, source, feature_type, start, end, score, strand, phase, attrs = parts[:9]
+            try:
+                start_i = int(start)
+                end_i = int(end)
+            except ValueError:
+                raise ValueError(f"Invalid GFF coordinates in {path}:{line_no}") from None
+
+            if start_i > end_i:
+                start_i, end_i = end_i, start_i
+
+            yield {
+                "seq_id": normalize_seq_id(seq_id),
+                "source": source,
+                "type": feature_type,
+                "start": start_i,
+                "end": end_i,
+                "strand": strand,
+                "attrs": attrs,
+            }
+
+
+def load_cds_intervals(gff_path):
+    """Return CDS intervals grouped by sequence ID."""
+    cds_by_seq = {}
+    for feat in parse_gff(gff_path):
+        if feat["type"].upper() != "CDS":
+            continue
+        cds_by_seq.setdefault(feat["seq_id"], []).append((feat["start"], feat["end"]))
+
+    for seq_id in cds_by_seq:
+        cds_by_seq[seq_id].sort()
+    return cds_by_seq
+
+
+def parse_rt_range(value):
+    """Parse RT coordinates in the form start-end or start:end."""
+    m = re.fullmatch(r"\s*(\d+)\s*[-:]\s*(\d+)\s*", value)
+    if not m:
+        return None
+    start_i, end_i = int(m.group(1)), int(m.group(2))
+    return (min(start_i, end_i), max(start_i, end_i))
+
+
+def infer_rt_gene_from_rt_gff(rt_gff_path, cds_by_seq, tag="rvt-retrons"):
+    """
+    Find RVT-Retrons domain in RT annotation GFF and map it to containing CDS.
+    Returns (seq_id, rt_start, rt_end).
+    """
+    domain_feat = None
+    for feat in parse_gff(rt_gff_path):
+        source_l = feat["source"].lower()
+        type_l = feat["type"].lower()
+        attrs_l = feat["attrs"].lower()
+        has_myrt = "myrt" in source_l
+        has_dom = ("dom" in source_l) or ("dom" in type_l)
+        if has_myrt and has_dom and tag.lower() in attrs_l:
+            domain_feat = feat
+            break
+
+    if domain_feat is None:
+        mes = f"Could not find RT domain feature with source containing 'myRT', source or type containing 'dom',  and attributes containing a {tag}"
+        raise ValueError(mes)
+
+    seq_id = domain_feat["seq_id"]
+    dom_start, dom_end = domain_feat["start"], domain_feat["end"]
+
+    cds_candidates = []
+    for start_i, end_i in cds_by_seq.get(seq_id, []):
+        if start_i <= dom_start and end_i >= dom_end:
+            cds_candidates.append((start_i, end_i))
+
+    if not cds_candidates:
+        raise ValueError(
+            "Could not find a CDS feature containing the RVT-Retrons domain "
+            f"({seq_id}:{dom_start}-{dom_end})."
+        )
+
+    # Prefer the largest containing CDS if multiple candidates are present.
+    cds_candidates.sort(key=lambda x: (x[1] - x[0], x[0]), reverse=True)
+    rt_start, rt_end = cds_candidates[0]
+    return seq_id, rt_start, rt_end
+
+
+def resolve_rt_gene(args, cds_by_seq):
+    """
+    Resolve RT gene coordinates from --rt input.
+    Returns (seq_id_or_none, rt_start, rt_end) or None.
+    """
+    if not args.rt:
+        return None
+
+    maybe_range = parse_rt_range(args.rt)
+    if maybe_range is not None:
+        rt_start, rt_end = maybe_range
+        seq_id = normalize_seq_id(args.rt_seq_id) if args.rt_seq_id else None
+        return seq_id, rt_start, rt_end
+
+    rt_path = Path(args.rt)
+    if not rt_path.exists() or not rt_path.is_file():
+        raise ValueError(
+            "--rt must be either a valid GFF file path or a coordinate range like 10635-12152."
+        )
+
+    return infer_rt_gene_from_rt_gff(str(rt_path), cds_by_seq, args.rt_tag)
+
+
+def merge_intervals(intervals):
+    """Merge possibly-overlapping 1-based closed intervals."""
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [list(intervals[0])]
+    for start_i, end_i in intervals[1:]:
+        last = merged[-1]
+        if start_i <= last[1] + 1:
+            last[1] = max(last[1], end_i)
+        else:
+            merged.append([start_i, end_i])
+    return [(s, e) for s, e in merged]
+
+
+def noncoding_segments_in_window(window_start, window_end, cds_intervals):
+    """Return non-coding segments inside [window_start, window_end]."""
+    if window_start > window_end:
+        return []
+
+    clipped = []
+    for cds_start, cds_end in cds_intervals:
+        if cds_end < window_start or cds_start > window_end:
+            continue
+        clipped.append((max(window_start, cds_start), min(window_end, cds_end)))
+    blocked = merge_intervals(clipped)
+
+    segments = []
+    cursor = window_start
+    for blk_start, blk_end in blocked:
+        if cursor < blk_start:
+            segments.append((cursor, blk_start - 1))
+        cursor = max(cursor, blk_end + 1)
+    if cursor <= window_end:
+        segments.append((cursor, window_end))
+    return segments
+
+
+def choose_rt_roi(seq_len, rt_start, rt_end, cds_intervals, upstream_window, downstream_window, min_roi_len):
+    """
+    Choose a non-coding search ROI in the upstream OR downstream RT window.
+    Returns dict with start/end/side/length/gap.
+    """
+    upstream_range = (max(1, rt_start - upstream_window), rt_start - 1)
+    downstream_range = (rt_end + 1, min(seq_len, rt_end + downstream_window))
+
+    candidates = []
+
+    for side, (w_start, w_end) in (("upstream", upstream_range), ("downstream", downstream_range)):
+        if w_start > w_end:
+            continue
+        for seg_start, seg_end in noncoding_segments_in_window(w_start, w_end, cds_intervals):
+            seg_len = seg_end - seg_start + 1
+            if seg_len < min_roi_len:
+                continue
+            if side == "upstream":
+                gap = max(0, rt_start - seg_end - 1)
+            else:
+                gap = max(0, seg_start - rt_end - 1)
+            candidates.append({
+                "start": seg_start,
+                "end": seg_end,
+                "side": side,
+                "length": seg_len,
+                "gap": gap,
+            })
+
+    if not candidates:
+        raise ValueError(
+            "No upstream/downstream non-coding segment is long enough for ncRNA scanning "
+            f"(minimum length {min_roi_len} nt)."
+        )
+
+    candidates.sort(key=lambda x: x["length"], reverse=True)
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +468,7 @@ def score_candidate(ir, has_5p_g, has_3p_g):
 # Main search
 # ---------------------------------------------------------------------------
 
-def search_sequence(seq_id, seq, args):
+def search_sequence(seq_id, seq, args, region_start=None, region_end=None):
     """
     Search a single nucleotide sequence for retron ncRNA candidates.
     Returns a list of candidate dicts.
@@ -273,13 +477,17 @@ def search_sequence(seq_id, seq, args):
     seq_len = len(seq)
 
     # Apply optional search-region constraints
-    start_offset = max(0, args.region_start - 1) if args.region_start else 0
-    end_offset   = min(seq_len, args.region_end)   if args.region_end   else seq_len
+    start_offset = max(0, region_start - 1) if region_start else 0
+    end_offset   = min(seq_len, region_end) if region_end else seq_len
     subseq = seq[start_offset:end_offset]
     sub_len = len(subseq)
 
     # Search both strands
-    for strand, working_seq in (("+", subseq), ("-", reverse_complement(subseq))):
+    strand_seqs = [("+", subseq)]
+    if args.both_strands:
+        strand_seqs.append(("-", reverse_complement(subseq)))
+
+    for strand, working_seq in strand_seqs:
         irs = find_inverted_repeats_fast(
             working_seq,
             min_arm=args.min_arm,
@@ -345,7 +553,7 @@ def search_sequence(seq_id, seq, args):
             })
 
     # Deduplicate overlapping hits on same (or the opposite) strand, keep highest score.
-    # A later hit is discarded if it overlaps at least half of the shorter
+    # A later hit is discarded if it overlaps at least 1/5 of the shorter
     # candidate; this removes many near-duplicates without
     # requiring one hit to be fully contained in the other.
     candidates.sort(key=lambda c: -c["score"])
@@ -362,7 +570,7 @@ def search_sequence(seq_id, seq, args):
             overlap_len = max(0, overlap_end - overlap_start + 1)
             shorter_len = min(c["cand_len"], k["cand_len"])
 
-            if shorter_len > 0 and overlap_len >= 0.5 * shorter_len:
+            if shorter_len > 0 and overlap_len >= 0.2 * shorter_len:
                 overlap = True
                 break
 
@@ -449,14 +657,94 @@ def write_tsv(candidates, out_path):
 
 def write_gff(candidates, out_path):
     """Write a summary in gff format alongside the FASTA."""
-    cols = ["seq_id", "annotator", "region", "start", "end", ".", "strand", "frame", "des"]
+    _ = ["seq_id", "annotator", "region", "start", "end", ".", "strand", "frame", "des"]
     with open(out_path, "w") as fh:
-        for idx, c in enumerate(candidates, 1):
-            stmp = c["seq_id"].split()
-            seq_id = stmp[0]
-            des = f"ID={seq_id}_{c["genome_start"]}_{c["genome_end"]}_{c["strand"]};what=ncRNA"
-            row = [seq_id, "rscan", "RNA", c["genome_start"], c["genome_end"], '.', c["strand"], '0', des]  
-            fh.write("\t".join(str(x) for x in row) + "\n")
+        for line in build_ncrna_gff_lines(candidates):
+            fh.write(line + "\n")
+
+
+def build_ncrna_gff_lines(candidates):
+    """Build GFF lines for ncRNA candidates."""
+    lines = []
+    for idx, c in enumerate(candidates, 1):
+        stmp = c["seq_id"].split()
+        seq_id = stmp[0]
+        des = f"ID={seq_id}_{c['genome_start']}_{c['genome_end']}_{c['strand']};what=ncRNA"
+        row = [seq_id, "rscan", "RNA", c["genome_start"], c["genome_end"], '.', c["strand"], '0', des]
+        lines.append("\t".join(str(x) for x in row))
+    return lines
+
+
+def parse_gff_feature_start(raw_line):
+    """Return (seq_id, start) for a GFF feature line, else None."""
+    if not raw_line or raw_line.startswith("#"):
+        return None
+    parts = raw_line.rstrip("\n").split("\t")
+    if len(parts) < 9:
+        return None
+    try:
+        start_i = int(parts[3])
+    except ValueError:
+        return None
+    return normalize_seq_id(parts[0]), start_i
+
+
+def write_rt_augmented_gff(base_gff_path, candidates, out_path):
+    """
+    Write a GFF based on base_gff_path, inserting ncRNA candidate lines so that
+    feature starts remain sorted from smallest to largest within each sequence.
+    """
+    pending = {}
+    seq_order = []
+
+    for line in build_ncrna_gff_lines(candidates):
+        parsed = parse_gff_feature_start(line)
+        if parsed is None:
+            continue
+        seq_id, start_i = parsed
+        if seq_id not in pending:
+            pending[seq_id] = []
+            seq_order.append(seq_id)
+        pending[seq_id].append((start_i, line))
+
+    for seq_id in pending:
+        pending[seq_id].sort(key=lambda x: x[0])
+
+    def flush_before(fh, seq_id, current_start):
+        q = pending.get(seq_id)
+        while q and q[0][0] < current_start:
+            fh.write(q.pop(0)[1] + "\n")
+
+    def flush_all_for_seq(fh, seq_id):
+        q = pending.get(seq_id)
+        while q:
+            fh.write(q.pop(0)[1] + "\n")
+
+    with open(out_path, "w") as fh:
+        prev_seq_id = None
+        with open(base_gff_path) as base_fh:
+            for raw_line in base_fh:
+                stripped = raw_line.rstrip("\n")
+                parsed = parse_gff_feature_start(stripped)
+
+                if parsed is None:
+                    fh.write(raw_line)
+                    continue
+
+                seq_id, start_i = parsed
+                if prev_seq_id is not None and seq_id != prev_seq_id:
+                    flush_all_for_seq(fh, prev_seq_id)
+
+                flush_before(fh, seq_id, start_i)
+                fh.write(raw_line)
+                prev_seq_id = seq_id
+
+        if prev_seq_id is not None:
+            flush_all_for_seq(fh, prev_seq_id)
+
+        # Append candidates for sequence IDs not present in the base file.
+        for seq_id in seq_order:
+            flush_all_for_seq(fh, seq_id)
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +782,13 @@ def build_parser():
         "--gff", default=None, metavar="gff",
         help="Optional: also write a summary in gff format.",
     )
+    p.add_argument(
+        "--rt_gff", default=None, metavar="RT_GFF_OUT",
+        help=(
+            "Optional: write a GFF based on the input --rt GFF, with detected ncRNA "
+            "features inserted in coordinate order. Requires --rt to be a GFF file path."
+        ),
+    )
 
     # --- search-region constraints ---
     region = p.add_argument_group("Search-region constraints (1-based, inclusive)")
@@ -505,6 +800,51 @@ def build_parser():
         "--region-end", type=int, default=None, metavar="INT",
         help="Last nucleotide of the region to search (1-based).",
     )
+    region.add_argument(
+        "--rt", default=None, metavar="RT_GFF_OR_RANGE",
+        help=(
+            "RT gene constraint source. Either a GFF path with an RT-domain line "
+            "(source contains 'myRT', source or type contains 'dom', attributes contain 'RVT-Retrons' by default; otherwise given by --rt_tag) "
+            "or a range like 10635-12152."
+        ),
+    )
+    region.add_argument(
+        "--rt_tag", default="RVT-Retrons", metavar="RT_GFF_OR_RANGE",
+        help=(
+            "what RT gene? default: RVT-Retrons; others: RVT-UG27 and so on."
+        ),
+    )
+    region.add_argument(
+        "--rt-seq-id", default=None, metavar="SEQ_ID",
+        help=(
+            "Sequence ID for --rt when coordinates are given directly and the input FASTA "
+            "contains multiple sequences."
+        ),
+    )
+    region.add_argument(
+        "--rt-upstream", type=int, default=3000, metavar="INT",
+        help="Number of nucleotides upstream of RT gene to include in search.",
+    )
+    region.add_argument(
+        "--rt-downstream", type=int, default=3000, metavar="INT",
+        help="Number of nucleotides downstream of RT gene to include in search.",
+    )
+
+    # --- optional CDS-guided ROI ---
+    p.add_argument(
+        "--cds-gff", default=None, metavar="CDS_GFF",
+        help=(
+            "Optional CDS GFF. When used together with --rt, it is used to pick a "
+            "non-coding upstream/downstream region of interest before scanning."
+        ),
+    )
+    p.add_argument(
+        "--min-roi-len", type=int, default=150, metavar="INT",
+        help=(
+            "Minimum length required for a CDS-free upstream/downstream ROI when "
+            "--rt and --cds-gff are used together."
+        ),
+    )
 
     # --- structural parameters ---
     struct = p.add_argument_group("Structural parameters")
@@ -513,7 +853,7 @@ def build_parser():
         help="Minimum inverted-repeat arm length (a1/a2 region).",
     )
     struct.add_argument(
-        "--max-loop", type=int, default=400, metavar="INT",
+        "--max-loop", type=int, default=300, metavar="INT",
         help="Maximum loop length between the two IR arms.",
     )
     struct.add_argument(
@@ -521,11 +861,11 @@ def build_parser():
         help="Maximum mismatches allowed in the IR arm pairing.",
     )
     struct.add_argument(
-        "--min-length", type=int, default=50, metavar="INT",
+        "--min-length", type=int, default=100, metavar="INT",
         help="Minimum total candidate ncRNA length (nt).",
     )
     struct.add_argument(
-        "--max-length", type=int, default=500, metavar="INT",
+        "--max-length", type=int, default=300, metavar="INT",
         help="Maximum total candidate ncRNA length (nt).",
     )
     struct.add_argument(
@@ -581,19 +921,110 @@ def main():
         parser.error("--min-arm must be ≥ 4.")
     if args.region_start and args.region_end and args.region_start > args.region_end:
         parser.error("--region-start must be ≤ --region-end.")
+    if args.rt and (args.region_start or args.region_end):
+        parser.error("Use either --region-start/--region-end OR --rt-based constraints, not both.")
+    if args.rt_upstream < 200 or args.rt_downstream < 200:
+        parser.error("--rt-upstream and --rt-downstream must be at least 200.")
+    if args.min_roi_len < 100:
+        parser.error("--min-roi-len must be at least 100.")
+    if args.rt_gff:
+        if not args.rt:
+            parser.error("--rt_gff requires --rt to be provided as a GFF file path.")
+        if parse_rt_range(args.rt) is not None:
+            parser.error("--rt_gff requires --rt to be a GFF file path, not a coordinate range.")
+        rt_path = Path(args.rt)
+        if not rt_path.exists() or not rt_path.is_file():
+            parser.error("--rt_gff requires --rt to point to an existing GFF file.")
 
     if args.verbose:
         print(f"[retron_ncrna_finder] Reading {args.input} …", file=sys.stderr)
 
+    cds_by_seq = {}
+    if args.cds_gff:
+        try:
+            cds_by_seq = load_cds_intervals(args.cds_gff)
+        except Exception as exc:
+            parser.error(f"Failed to parse --cds-gff: {exc}")
+
+    rt_gene = None
+    if args.rt:
+        try:
+            rt_gene = resolve_rt_gene(args, cds_by_seq)
+        except Exception as exc:
+            parser.error(f"Failed to resolve --rt constraint: {exc}")
+
+    seq_records = list(parse_fasta(args.input))
+    n_seqs = len(seq_records)
+    if n_seqs == 0:
+        parser.error("No sequences found in input FASTA.")
+
+    if rt_gene and rt_gene[0] is None and n_seqs > 1:
+        parser.error(
+            "When --rt is provided as coordinates and FASTA has multiple sequences, "
+            "--rt-seq-id is required."
+        )
+
     all_candidates = []
-    n_seqs = 0
 
-    for seq_id, seq in parse_fasta(args.input):
-        n_seqs += 1
+    for seq_id, seq in seq_records:
+        norm_seq_id = normalize_seq_id(seq_id)
+
+        region_start = args.region_start
+        region_end = args.region_end
+        region_note = None
+
+        if rt_gene:
+            rt_seq_id, rt_start, rt_end = rt_gene
+            if rt_seq_id is not None and norm_seq_id != rt_seq_id:
+                if args.verbose:
+                    print(
+                        f"  Skipping {seq_id}: RT constraint is for sequence {rt_seq_id}.",
+                        file=sys.stderr,
+                    )
+                continue
+
+            if args.cds_gff:
+                cds_intervals = cds_by_seq.get(norm_seq_id, [])
+                if not cds_intervals:
+                    parser.error(
+                        f"No CDS intervals found for sequence '{norm_seq_id}' in --cds-gff."
+                    )
+                try:
+                    roi = choose_rt_roi(
+                        seq_len=len(seq),
+                        rt_start=rt_start,
+                        rt_end=rt_end,
+                        cds_intervals=cds_intervals,
+                        upstream_window=args.rt_upstream,
+                        downstream_window=args.rt_downstream,
+                        min_roi_len=args.min_roi_len,
+                    )
+                except ValueError as exc:
+                    parser.error(f"Failed to identify CDS-free RT ROI: {exc}")
+                print(f"  Chosen RT ROI for {seq_id}: start={roi['start']}, end={roi['end']}, side={roi['side']}, length={roi['length']}, gap_from_RT={roi['gap']}", file=sys.stderr)
+                region_start = roi["start"]
+                region_end = roi["end"]
+                region_note = (
+                    f"{roi['side']} CDS-free ROI, len={roi['length']} nt, gap_from_RT={roi['gap']} nt"
+                )
+            else:
+                region_start = max(1, rt_start - args.rt_upstream)
+                region_end = min(len(seq), rt_end + args.rt_downstream)
+                region_note = "RT window"
+
         if args.verbose:
-            print(f"  Searching {seq_id} ({len(seq):,} nt) …", file=sys.stderr)
+            if region_start and region_end:
+                print(
+                    f"  Searching {seq_id} ({len(seq):,} nt) in region {region_start}-{region_end}"
+                    f" ({region_note}) …" if region_note else
+                    f"  Searching {seq_id} ({len(seq):,} nt) in region {region_start}-{region_end} …",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"  Searching {seq_id} ({len(seq):,} nt) …", file=sys.stderr)
 
-        hits = search_sequence(seq_id, seq, args)
+        print(f"  Searching sequence {seq_id} in region {region_start}-{region_end} …", file=sys.stderr)
+        hits = search_sequence(seq_id, seq, args, region_start=region_start, region_end=region_end)
 
         # Score filter
         hits = [h for h in hits if h["score"] >= args.min_score]
@@ -605,6 +1036,7 @@ def main():
 
     # Global sort + top-N
     all_candidates.sort(key=lambda c: -c["score"])
+
     if args.top:
         all_candidates = all_candidates[: args.top]
 
@@ -620,6 +1052,11 @@ def main():
         write_gff(all_candidates, args.gff)
         if args.verbose:
             print(f"[retron_ncrna_finder] GFF written to {args.gff}", file=sys.stderr)
+
+    if args.rt_gff:
+        write_rt_augmented_gff(args.rt, all_candidates, args.rt_gff)
+        if args.verbose:
+            print(f"[retron_ncrna_finder] RT-augmented GFF written to {args.rt_gff}", file=sys.stderr)
 
     print(
         f"[retron_ncrna_finder] Done. "
