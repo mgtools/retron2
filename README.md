@@ -39,8 +39,8 @@ Useful options (run with `--help` for the complete list):
 
 - `--min-arm`, `--max-loop`, and `--max-mismatch` control the inverted-repeat
 	search. Defaults are 8 nt, 400 nt, and 1 mismatch.
-- `--min-length` and `--max-length` constrain candidate length (defaults: 50
-	and 500 nt).
+- `--min-length` and `--max-length` constrain candidate length (defaults: 100
+	and 300 nt).
 - `--region-start` and `--region-end` limit the search to a 1-based inclusive
 	interval in each input sequence.
 - `--require-g` keeps only candidates with G at both inner arm-junction
@@ -50,6 +50,8 @@ Useful options (run with `--help` for the complete list):
 	the highest-scoring candidates.
 - `--forward-only` searches only the input strand; otherwise both strands are
 	searched.
+
+We note this scanner outputs candidate regions that have the features. 
 
 ### Example genomes
 
