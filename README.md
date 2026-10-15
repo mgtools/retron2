@@ -120,3 +120,5 @@ currently renders only the `()` pairs.
 
 Claude.ai was used during development. 
 
+Reference: Yuzhen Ye. Computational Evidence that Array-Associated Reverse Transcriptase Loci Are Retron Systems with Multiple ncRNA Genes. Research Square preprint: https://www.researchsquare.com/article/rs-11367685/v1 (DOI: https://doi.org/10.21203/rs.3.rs-11367685/v1)
+
